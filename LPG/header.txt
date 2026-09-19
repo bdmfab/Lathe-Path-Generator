@@ -1,0 +1,11 @@
+; %
+; --- LinuxCNC 2-Axis Lathe G-Code ---
+; Edit this file (header.txt) to change machine startup codes
+G21          ; Millimeters mode
+G18          ; XZ Plane Selection
+G7           ; Diameter Programming Mode
+G90          ; Absolute coordinates
+G97          ; Constant RPM
+G50 S2500    ; Cap maximum spindle RPM to 2500
+T1 M6        ; Select Tool 1 and execute change
+G94          ; Feed per Min

@@ -1,0 +1,6 @@
+; --- Machine Teardown Codes ---
+; Edit this file (footer.txt) to change machine shutdown sequences
+G00 Z30.0 M5 ; Move carriage clear, Spindle STOP
+M9           ; Coolant OFF
+M30          ; End of Program, Reset Pointers
+; %
