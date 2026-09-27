@@ -76,3 +76,52 @@ rm -f "$TEMP_LIST"
 # Show the detailed success notification with the full list populated perfectly
 zenity --info --width=450 --height=350 --title="Export Complete" --text="Successfully converted <b>$total_files</b> drawing(s)!\n\n<b>Saved in:</b>\n$TARGET_DIR/PDF\n\n<b>Processed Files:</b>\n$file_list"
 
+# Ask the user if they'd like to merge the resulting PDFs into one file
+if zenity --question --title="Merge PDFs?" --text="Would you like to merge all $total_files converted PDF(s) into a single PDF using pdfunite?" --width=350; then
+
+    # Check that pdfunite is actually available before going further
+    if ! command -v pdfunite &> /dev/null; then
+        zenity --error --text="pdfunite was not found on this system.\n\nPlease install poppler-utils (which provides pdfunite) and try again."
+        exit 1
+    fi
+
+    # Prompt for the desired output filename (without needing the .pdf extension)
+    OUTPUT_NAME=$(zenity --entry --title="Merge PDFs" --text="Enter the output filename for the merged PDF:" --entry-text="merged")
+
+    # Exit gracefully if the user cancelled the filename prompt
+    if [ -z "$OUTPUT_NAME" ]; then
+        zenity --info --text="Merge cancelled."
+        exit 0
+    fi
+
+    # Strip any .pdf extension the user may have typed, then add it back cleanly
+    OUTPUT_NAME="${OUTPUT_NAME%.pdf}"
+    OUTPUT_NAME="${OUTPUT_NAME%.PDF}"
+    OUTPUT_PATH="PDF/${OUTPUT_NAME}.pdf"
+
+    # Build the list of PDFs to merge, in the same order they were converted
+    mapfile -t PDF_FILES < <(printf '%s\n' "$file_list" | sed 's/^- //' | sed 's/\.[^.]*$/.pdf/')
+
+    # Prefix each with the PDF/ directory and confirm each file actually exists
+    MERGE_INPUTS=()
+    for pdf in "${PDF_FILES[@]}"; do
+        candidate="PDF/$pdf"
+        if [ -f "$candidate" ]; then
+            MERGE_INPUTS+=("$candidate")
+        fi
+    done
+
+    # Make sure we actually have something to merge
+    if [ "${#MERGE_INPUTS[@]}" -eq 0 ]; then
+        zenity --error --text="No converted PDF files could be found to merge."
+        exit 1
+    fi
+
+    # Run pdfunite on the collected files
+    if pdfunite "${MERGE_INPUTS[@]}" "$OUTPUT_PATH"; then
+        zenity --info --width=400 --title="Merge Complete" --text="Successfully merged ${#MERGE_INPUTS[@]} PDF(s) into:\n\n<b>$TARGET_DIR/$OUTPUT_PATH</b>"
+    else
+        zenity --error --text="pdfunite failed to merge the PDF files.\n\nCheck that all files are valid, non-encrypted PDFs."
+        exit 1
+    fi
+fi
