@@ -1,15 +1,29 @@
 import os
+import json
+import re
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from dxf_parser import extract_profile_from_dxf
 from gcode_engine import calculate_roughing_moves, export_linuxcnc_file, densify_profile
 
+SETTINGS_FILE = "lathe_cam_settings.json"
+
+# G-code review-panel syntax highlighting: color a whole word by its leading
+# letter (G00 -> green, M03 -> blue, Z-10.100 -> red), not just the letter
+# itself. The negative lookbehind keeps this from matching mid-word (e.g.
+# the "M" in a comment word), only a fresh G/M/Z followed by a number.
+GCODE_HIGHLIGHT_PATTERNS = [
+    (re.compile(r'(?<![A-Za-z0-9.])G-?\d+(?:\.\d+)?', re.IGNORECASE), "g_tag"),
+    (re.compile(r'(?<![A-Za-z0-9.])M-?\d+(?:\.\d+)?', re.IGNORECASE), "m_tag"),
+    (re.compile(r'(?<![A-Za-z0-9.])Z-?\d+(?:\.\d+)?', re.IGNORECASE), "z_tag"),
+]
+
 class DxfVisualizerApp:
     def __init__(self, root):
         self.root = root
         self.root.title("QCAD Lathe Visualizer & CAM Engine")
-        self.root.geometry("920x700")
+        self.root.geometry("1300x700")
         self.root.resizable(False, False)
         
         self.profile_data = []
@@ -25,10 +39,52 @@ class DxfVisualizerApp:
         self.css_val = tk.StringVar(value="250")
         self.fpm_val = tk.StringVar(value="100.0")
         self.fpr_val = tk.StringVar(value="0.12")
+        self.max_rpm_val = tk.StringVar(value="2500")
         self.use_css = tk.BooleanVar(value=True)
         self.use_fpr = tk.BooleanVar(value=True)
 
+        self._load_settings()
         self.build_ui()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _string_setting_vars(self):
+        """Every entry field that should persist between runs."""
+        return {
+            "stock_dia": self.stock_dia, "doc_val": self.doc_val,
+            "finish_allow": self.finish_allow, "nose_radius": self.nose_radius,
+            "rpm_val": self.rpm_val, "css_val": self.css_val,
+            "fpm_val": self.fpm_val, "fpr_val": self.fpr_val,
+            "max_rpm_val": self.max_rpm_val,
+        }
+
+    def _bool_setting_vars(self):
+        return {"use_css": self.use_css, "use_fpr": self.use_fpr}
+
+    def _load_settings(self):
+        try:
+            with open(SETTINGS_FILE, "r") as f:
+                data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return  # no saved settings yet, or the file is unreadable - keep the defaults
+        for key, var in self._string_setting_vars().items():
+            if key in data:
+                var.set(data[key])
+        for key, var in self._bool_setting_vars().items():
+            if key in data:
+                var.set(bool(data[key]))
+
+    def _save_settings(self):
+        data = {key: var.get() for key, var in self._string_setting_vars().items()}
+        data.update({key: var.get() for key, var in self._bool_setting_vars().items()})
+        try:
+            with open(SETTINGS_FILE, "w") as f:
+                json.dump(data, f, indent=2)
+        except OSError:
+            pass  # non-fatal - just means this run's values won't be remembered
+
+    def _on_close(self):
+        self._save_settings()
+        self.root.destroy()
         
     def build_ui(self):
         tf = ttk.Frame(self.root, padding="10")
@@ -47,6 +103,9 @@ class DxfVisualizerApp:
 
         ttk.Label(tf, text="Nose R:").grid(row=0, column=7, sticky=tk.W)
         ttk.Entry(tf, textvariable=self.nose_radius, width=5).grid(row=0, column=8, padx=(0,5))
+
+        ttk.Label(tf, text="Max RPM:").grid(row=0, column=9, sticky=tk.W)
+        ttk.Entry(tf, textvariable=self.max_rpm_val, width=6).grid(row=0, column=10, padx=(0,5))
 
         ttk.Button(tf, text="🔄 Refresh", command=self.process_geometry).grid(row=0, column=13, rowspan=2, padx=5, sticky="ns")
         ttk.Button(tf, text="⚡ Export G-Code", command=self.trigger_gcode_export).grid(row=0, column=14, rowspan=2, sticky="ns")
@@ -70,10 +129,44 @@ class DxfVisualizerApp:
         self.status_lbl = ttk.Label(tf, text="Status: Ready", foreground="gray")
         self.status_lbl.grid(row=2, column=0, columnspan=15, sticky=tk.W, pady=(5,0))
         
-        canvas_frame = ttk.LabelFrame(self.root, text=" Live Path Preview (Red=G00, Green=G01, Cyan=Part Shape) ", padding="10")
-        canvas_frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=(0, 15))
+        body = ttk.Frame(self.root)
+        body.pack(fill=tk.BOTH, expand=True, padx=15, pady=(0, 15))
+
+        canvas_frame = ttk.LabelFrame(body, text=" Live Path Preview (Red=G00, Green=G01, Cyan=Part Shape) ", padding="10")
+        canvas_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
         self.canvas = tk.Canvas(canvas_frame, bg="#1e1e1e", highlightthickness=0)
         self.canvas.pack(fill=tk.BOTH, expand=True)
+
+        gcode_frame = ttk.LabelFrame(body, text=" G-Code Review ", padding="5")
+        gcode_frame.pack(side=tk.RIGHT, fill=tk.Y)
+        gcode_frame.pack_propagate(False)
+        gcode_frame.configure(width=380)
+
+        text_container = ttk.Frame(gcode_frame)
+        text_container.pack(fill=tk.BOTH, expand=True)
+        scrollbar = ttk.Scrollbar(text_container)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.gcode_text = tk.Text(text_container, wrap="none", bg="#1e1e1e", fg="#dddddd",
+                                   insertbackground="#dddddd", font=("Courier New", 9),
+                                   yscrollcommand=scrollbar.set, state="disabled")
+        self.gcode_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.config(command=self.gcode_text.yview)
+
+        self.gcode_text.tag_configure("g_tag", foreground="#33ff33")
+        self.gcode_text.tag_configure("m_tag", foreground="#4da6ff")
+        self.gcode_text.tag_configure("z_tag", foreground="#ff5555")
+
+    def _show_gcode(self, text):
+        """Load g-code text into the review panel with G/M/Z syntax highlighting."""
+        self.gcode_text.config(state="normal")
+        self.gcode_text.delete("1.0", "end")
+        self.gcode_text.insert("1.0", text)
+        for _, tag in GCODE_HIGHLIGHT_PATTERNS:
+            self.gcode_text.tag_remove(tag, "1.0", "end")
+        for pattern, tag in GCODE_HIGHLIGHT_PATTERNS:
+            for m in pattern.finditer(text):
+                self.gcode_text.tag_add(tag, f"1.0+{m.start()}c", f"1.0+{m.end()}c")
+        self.gcode_text.config(state="disabled")
         
     def browse_file(self):
         s = filedialog.askopenfilename(filetypes=[("DXF Files", "*.dxf")])
@@ -107,6 +200,7 @@ class DxfVisualizerApp:
             css = float(self.css_val.get())
             fpm = float(self.fpm_val.get())
             fpr = float(self.fpr_val.get())
+            max_rpm = float(self.max_rpm_val.get())
         except ValueError:
             messagebox.showerror("Error", "All entries must be valid numbers.")
             return
@@ -121,7 +215,11 @@ class DxfVisualizerApp:
             export_linuxcnc_file(out_file, pts, stk, doc, alw,
                                   nose_radius=nrad,
                                   use_css=self.use_css.get(), css_speed=css, rpm=rpm,
-                                  use_fpr=self.use_fpr.get(), fpr_feed=fpr, fpm_feed=fpm)
+                                  use_fpr=self.use_fpr.get(), fpr_feed=fpr, fpm_feed=fpm,
+                                  max_rpm=max_rpm)
+            with open(out_file, "r") as f:
+                self._show_gcode(f.read())
+            self._save_settings()
             messagebox.showinfo("Success", f"G-Code written directly to folder:\n{b_name}.ngc")
         except Exception as e:
             messagebox.showerror("Error", f"Export Failed: {str(e)}")

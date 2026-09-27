@@ -167,6 +167,26 @@ def _seg_r_range(seg):
     return (min(seg["p1"][1], seg["p2"][1]), max(seg["p1"][1], seg["p2"][1]))
 
 
+def _r_at_z(seg, z):
+    """Given a Z known to lie within this segment's own Z-range, return the
+    boundary's radius there (inverse of the crossing search in _z_at_r)."""
+    if seg["kind"] == "line":
+        (z1, r1), (z2, r2) = seg["p1"], seg["p2"]
+        if z2 == z1:
+            return r1
+        t = max(0.0, min(1.0, (z - z1) / (z2 - z1)))
+        return r1 + t * (r2 - r1)
+    cz, cr = seg["center"]
+    val = max(seg["radius"] ** 2 - (z - cz) ** 2, 0.0)
+    dr = math.sqrt(val)
+    r1, r2 = seg["p1"][1], seg["p2"][1]
+    lo_r, hi_r = min(r1, r2), max(r1, r2)
+    candidates = [r for r in (cr - dr, cr + dr) if lo_r - 1e-6 <= r <= hi_r + 1e-6]
+    if not candidates:
+        candidates = [cr - dr, cr + dr]
+    return min(candidates, key=lambda r: abs(r - seg["p1"][1]))
+
+
 def _z_at_r(boundary, target_r):
     """First Z (walking from the shallow end) where the boundary's radius
     reaches target_r. Returns None if it never does."""
@@ -203,12 +223,17 @@ def _emit_cut(gcode, seg, feed_str=""):
         gcode.append(f"{code} X{tr * 2:.3f} Z{tz:.3f} R{seg['radius']:.3f}{feed_str}")
 
 
-def _arc_sample_points(seg, n=12):
-    """Sample n+1 points along an arc segment from p1 to p2 (for the canvas
-    preview only, which draws plain line segments)."""
+def _arc_sample_points(seg, n=12, start=None):
+    """Sample n+1 points along an arc segment from `start` (default: the
+    segment's own p1) to p2 - for the canvas preview only, which draws
+    plain line segments. `start` must already lie on the arc; pass it
+    explicitly when the tool reaches this arc partway through (e.g. after
+    a radial correction move), so the sampled points continue forward from
+    there instead of restarting at the segment's original endpoint."""
     cz, cr = seg["center"]
     radius = seg["radius"]
-    a1 = math.atan2(seg["p1"][1] - cr, seg["p1"][0] - cz)
+    start = start if start is not None else seg["p1"]
+    a1 = math.atan2(start[1] - cr, start[0] - cz)
     a2 = math.atan2(seg["p2"][1] - cr, seg["p2"][0] - cz)
     if seg.get("ccw", True):
         if a2 < a1:
@@ -269,8 +294,8 @@ def calculate_roughing_moves(profile, stock_dia, doc, allowance, nose_radius=0.2
         allowance_boundary, combined_boundary = [], []
         floor_dia = 0.0
 
-    def seg_points(seg):
-        return _arc_sample_points(seg) if seg["kind"] == "arc" else [seg["p1"], seg["p2"]]
+    def seg_points(seg, start=None):
+        return _arc_sample_points(seg, start=start) if seg["kind"] == "arc" else [seg["p1"], seg["p2"]]
 
     curr_dia = float(stock_dia)
     tail_traced = False
@@ -299,9 +324,16 @@ def calculate_roughing_moves(profile, stock_dia, doc, allowance, nose_radius=0.2
                     if math.hypot(last_pos[0] - seg["p1"][0], last_pos[1] - seg["p1"][1]) < 1e-6:
                         for (z, r) in seg_points(seg)[1:]:
                             moves.append({"type": "G01", "x": r * 2, "z": z})
-                    else:
+                    elif seg["kind"] == "line":
                         tz, tr = seg["p2"]
                         moves.append({"type": "G01", "x": tr * 2, "z": tz})
+                    else:
+                        z1, z2 = seg["p1"][0], seg["p2"][0]
+                        z_on = max(min(z1, z2), min(max(z1, z2), last_pos[0]))
+                        r_here = _r_at_z(seg, z_on)
+                        moves.append({"type": "G01", "x": r_here * 2, "z": z_on})
+                        for (z, r) in seg_points(seg, start=(z_on, r_here))[1:]:
+                            moves.append({"type": "G01", "x": r * 2, "z": z})
                     last_pos = seg["p2"]
             moves.append({"type": "G01", "x": x_relief, "z": last_pos[0]})
             tail_traced = True
@@ -316,7 +348,7 @@ def calculate_roughing_moves(profile, stock_dia, doc, allowance, nose_radius=0.2
 
 def ensure_headers():
     h = ("; %\n; --- LinuxCNC 2-Axis Lathe G-Code ---\nG21; MM\nG18; XZ\nG7; Dia\n"
-         "G90; Abs\nG97; Constant RPM\nG50 S2500\nT1 M6\nG94; Feed/Min")
+         "G90; Abs\nG97; Constant RPM\nT1 M6\nG94; Feed/Min")
     f = ("; %\n; --- Machine Teardown Codes ---\nG00 Z30.0 M5\nM9\nM30\n; %")
     if not os.path.exists("header.txt"):
         with open("header.txt", "w") as out: out.write(h)
@@ -328,7 +360,7 @@ def export_linuxcnc_file(out_path, profile, stock_dia, doc, allowance,
                           nose_radius=0.2,
                           use_css=True, css_speed=250, rpm=1000,
                           use_fpr=True, fpr_feed=0.12, fpm_feed=100.0,
-                          clr=2.0, approach_margin=1.0):
+                          clr=2.0, approach_margin=1.0, max_rpm=2500):
     ensure_headers()
     gcode = []
 
@@ -348,6 +380,7 @@ def export_linuxcnc_file(out_path, profile, stock_dia, doc, allowance,
     feed = fpr_feed if use_fpr else fpm_feed
 
     with open("header.txt", "r") as f: gcode.append(f.read().strip())
+    gcode.append(f"G50 S{max_rpm:.0f}    ; Cap maximum spindle RPM to {max_rpm:.0f}")
 
     # Dynamic parameter block: documents the actual values this job was run with
     gcode.append(f"; Stock Size - {stock_dia:.0f}mm")
@@ -359,7 +392,7 @@ def export_linuxcnc_file(out_path, profile, stock_dia, doc, allowance,
     else:
         gcode.append(f"; Feed - {fpm_feed:.1f} mm/min (FPM)")
     if use_css:
-        gcode.append(f"; CSS - {css_speed:.0f} mm/m")
+        gcode.append(f"; CSS - {css_speed:.0f} m/min")
     else:
         gcode.append(f"; RPM - {rpm:.0f} (constant RPM, no CSS)")
     gcode.append("; %")
@@ -420,64 +453,64 @@ def export_linuxcnc_file(out_path, profile, stock_dia, doc, allowance,
         gcode.append(f"(Pass {p_num} - X: {curr_dia:.3f})")
         gcode.append(f"G00 X{curr_dia:.3f}")
 
+        # Manual CSS-equivalent: only when CSS mode itself isn't active but
+        # a target surface speed was given anyway, compute the RPM that
+        # would produce it at this pass's diameter and set it explicitly
+        # (G97 doesn't auto-adjust RPM as diameter changes the way G96
+        # does, so this re-creates that behavior pass by pass).
+        pass_rpm = rpm
+        if not use_css and css_speed:
+            pass_rpm = min(max_rpm, (css_speed * 1000.0) / (math.pi * curr_dia))
+            gcode.append(f"S{pass_rpm:.0f}")
+
+        # Manual FPR-equivalent: only when FPR mode itself isn't active but
+        # a target feed-per-rev was given anyway, convert it to the
+        # equivalent mm/min at whatever RPM this pass is actually running
+        # (the CSS-equivalent above if that just fired, else the base RPM).
+        pass_feed = feed
+        if not use_fpr and fpr_feed:
+            pass_feed = fpr_feed * pass_rpm
+
         if z_limit is None:
             # The boundary never gets in the way at this diameter.
-            gcode.append(f"G01 Z{full_length_z:.3f} F{feed:.3f}")
-            gcode.append(f"G01 X{x_relief:.3f} F{feed:.3f}")
+            gcode.append(f"G01 Z{full_length_z:.3f} F{pass_feed:.3f}")
+            gcode.append(f"G01 X{x_relief:.3f} F{pass_feed:.3f}")
         elif not tail_traced:
             # First pass to reach the boundary - it alone is responsible for
             # clearing everything deeper. Cut to the safe depth, then trace
             # the true finish-allowance boundary the rest of the way to the
             # end (no later, smaller pass will ever need to visit it again).
-            gcode.append(f"G01 Z{z_limit:.3f} F{feed:.3f}")
+            gcode.append(f"G01 Z{z_limit:.3f} F{pass_feed:.3f}")
             last_pos = (z_limit, target_r)
             for seg in allowance_boundary:
                 if seg["p2"][0] < z_limit - 1e-9:
                     if math.hypot(last_pos[0] - seg["p1"][0], last_pos[1] - seg["p1"][1]) < 1e-6:
                         # Tool is actually on this segment's own curve -
                         # cut it properly (G02/G03 for an arc).
-                        _emit_cut(gcode, seg, feed_str=f" F{feed:.3f}")
-                    else:
-                        # This is the entry segment straddling z_limit - the
-                        # tool ISN'T at its true start point, so a fixed-
-                        # radius arc here would pass through the wrong
-                        # center. Approximate the transition with a
-                        # straight line instead (same tolerance already
-                        # accepted for a straddled line segment).
+                        _emit_cut(gcode, seg, feed_str=f" F{pass_feed:.3f}")
+                    elif seg["kind"] == "line":                        
                         tz, tr = seg["p2"]
-                        gcode.append(f"G01 X{tr * 2:.3f} Z{tz:.3f} F{feed:.3f}")
+                        gcode.append(f"G01 X{tr * 2:.3f} Z{tz:.3f} F{pass_feed:.3f}")
+                    else:                        
+                        z1, z2 = seg["p1"][0], seg["p2"][0]
+                        z_on = max(min(z1, z2), min(max(z1, z2), last_pos[0]))
+                        r_here = _r_at_z(seg, z_on)
+                        gcode.append(f"G01 X{r_here * 2:.3f} Z{z_on:.3f} F{pass_feed:.3f}")
+                        _emit_cut(gcode, seg, feed_str=f" F{pass_feed:.3f}")
                     last_pos = seg["p2"]
-            gcode.append(f"G01 X{x_relief:.3f} F{feed:.3f}")
+            gcode.append(f"G01 X{x_relief:.3f} F{pass_feed:.3f}")
             tail_traced = True
         else:
             # The tail was already cleared by an earlier pass - just take
             # this shallower slice and retract to what that pass left behind.
-            gcode.append(f"G01 Z{z_limit:.3f} F{feed:.3f}")
-            gcode.append(f"G01 X{prev_dia:.3f} F{feed:.3f}")
+            gcode.append(f"G01 Z{z_limit:.3f} F{pass_feed:.3f}")
+            gcode.append(f"G01 X{prev_dia:.3f} F{pass_feed:.3f}")
 
         gcode.append(f"G00 Z{clr:.3f}")
         prev_dia = curr_dia
         p_num += 1
 
-    # 3. Finish profile contour pass - nose-radius compensated.
-    # NOTE: the sorted profile's last point is the sketch closing back to the
-    # centerline (the DXF's drawn face at the far end) - it's not OD material
-    # to cut, so it's excluded up front (cut_points).
-    #
-    # Every segment junction in cut_points is a true corner (or a smooth,
-    # tangent blend, e.g. a fillet arc) EXCEPT the very last point (nothing
-    # follows it but a retract). A round-nosed tool can't trace a sharp
-    # corner without adjustment: the imaginary tip position there is found
-    # by offsetting each adjacent segment perpendicular by the nose radius
-    # (an arc offsets to the same center with an adjusted radius),
-    # intersecting the two offset curves for the nose CENTER's position at
-    # that corner, then converting center -> tip by subtracting the nose
-    # radius from both Z and R. An arc segment's own radius for cutting is
-    # that same offset radius - only its center shifts, which the R-format
-    # G02/G03 move (with its two compensated endpoints) already captures
-    # without needing the center explicitly. The very first point is
-    # replaced by the established "past center" facing standoff, and the
-    # very last point is cut at its true (uncompensated) value.
+    
     cut_points = profile[:-1] if len(profile) > 1 else profile
     true_segments = _segments_from_points(cut_points)
 
