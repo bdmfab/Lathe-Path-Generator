@@ -6,6 +6,8 @@ from tkinter import filedialog, messagebox, ttk
 
 from dxf_parser import extract_profile_from_dxf
 from gcode_engine import calculate_roughing_moves, export_linuxcnc_file, densify_profile
+from thread_engine import (ISO_COARSE_PRESETS, build_thread_program, export_thread_file,
+                           thread_geometry, estimate_pass_count)
 
 SETTINGS_FILE = "lathe_cam_settings.json"
 
@@ -23,7 +25,7 @@ class DxfVisualizerApp:
     def __init__(self, root):
         self.root = root
         self.root.title("QCAD Lathe Visualizer & CAM Engine")
-        self.root.geometry("1300x700")
+        self.root.geometry("1300x740")
         self.root.resizable(False, False)
         
         self.profile_data = []
@@ -43,6 +45,23 @@ class DxfVisualizerApp:
         self.use_css = tk.BooleanVar(value=True)
         self.use_fpr = tk.BooleanVar(value=True)
 
+        # G76 thread tab
+        self.th_type = tk.StringVar(value="External")
+        self.th_preset = tk.StringVar(value="")
+        self.th_major = tk.StringVar(value="10.0")
+        self.th_pitch = tk.StringVar(value="1.5")
+        self.th_length = tk.StringVar(value="15.0")
+        self.th_z_start = tk.StringVar(value="5.0")
+        self.th_clear = tk.StringVar(value="2.0")
+        self.th_depth = tk.StringVar(value="0")
+        self.th_j = tk.StringVar(value="0.15")
+        self.th_r = tk.StringVar(value="1.5")
+        self.th_q = tk.StringVar(value="29.5")
+        self.th_h = tk.StringVar(value="2")
+        self.th_e = tk.StringVar(value="0")
+        self.th_l = tk.StringVar(value="0 - None")
+        self.th_rpm = tk.StringVar(value="400")
+
         self._load_settings()
         self.build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -55,6 +74,12 @@ class DxfVisualizerApp:
             "rpm_val": self.rpm_val, "css_val": self.css_val,
             "fpm_val": self.fpm_val, "fpr_val": self.fpr_val,
             "max_rpm_val": self.max_rpm_val,
+            "th_type": self.th_type, "th_major": self.th_major,
+            "th_pitch": self.th_pitch, "th_length": self.th_length,
+            "th_z_start": self.th_z_start, "th_clear": self.th_clear,
+            "th_depth": self.th_depth, "th_j": self.th_j, "th_r": self.th_r,
+            "th_q": self.th_q, "th_h": self.th_h, "th_e": self.th_e,
+            "th_l": self.th_l, "th_rpm": self.th_rpm,
         }
 
     def _bool_setting_vars(self):
@@ -87,7 +112,15 @@ class DxfVisualizerApp:
         self.root.destroy()
         
     def build_ui(self):
-        tf = ttk.Frame(self.root, padding="10")
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
+        self.profile_tab = ttk.Frame(self.notebook)
+        self.thread_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.profile_tab, text="  Profile / Roughing  ")
+        self.notebook.add(self.thread_tab, text="  G76 Thread  ")
+        self._build_thread_tab()
+
+        tf = ttk.Frame(self.profile_tab, padding="10")
         tf.pack(fill=tk.X, side=tk.TOP)
         
         ttk.Button(tf, text="📁 Open DXF", command=self.browse_file).grid(row=0, column=0, rowspan=2, padx=(0,10), sticky="ns")
@@ -129,7 +162,7 @@ class DxfVisualizerApp:
         self.status_lbl = ttk.Label(tf, text="Status: Ready", foreground="gray")
         self.status_lbl.grid(row=2, column=0, columnspan=15, sticky=tk.W, pady=(5,0))
         
-        body = ttk.Frame(self.root)
+        body = ttk.Frame(self.profile_tab)
         body.pack(fill=tk.BOTH, expand=True, padx=15, pady=(0, 15))
 
         canvas_frame = ttk.LabelFrame(body, text=" Live Path Preview (Red=G00, Green=G01, Cyan=Part Shape) ", padding="10")
@@ -156,17 +189,183 @@ class DxfVisualizerApp:
         self.gcode_text.tag_configure("m_tag", foreground="#4da6ff")
         self.gcode_text.tag_configure("z_tag", foreground="#ff5555")
 
-    def _show_gcode(self, text):
-        """Load g-code text into the review panel with G/M/Z syntax highlighting."""
-        self.gcode_text.config(state="normal")
-        self.gcode_text.delete("1.0", "end")
-        self.gcode_text.insert("1.0", text)
+    def _show_gcode(self, text, widget=None):
+        """Load g-code text into a review panel with G/M/Z syntax highlighting.
+        Defaults to the profile tab's panel."""
+        widget = widget or self.gcode_text
+        widget.config(state="normal")
+        widget.delete("1.0", "end")
+        widget.insert("1.0", text)
         for _, tag in GCODE_HIGHLIGHT_PATTERNS:
-            self.gcode_text.tag_remove(tag, "1.0", "end")
+            widget.tag_remove(tag, "1.0", "end")
         for pattern, tag in GCODE_HIGHLIGHT_PATTERNS:
             for m in pattern.finditer(text):
-                self.gcode_text.tag_add(tag, f"1.0+{m.start()}c", f"1.0+{m.end()}c")
-        self.gcode_text.config(state="disabled")
+                widget.tag_add(tag, f"1.0+{m.start()}c", f"1.0+{m.end()}c")
+        widget.config(state="disabled")
+
+    # ------------------------------------------------------------------
+    # G76 thread tab
+    # ------------------------------------------------------------------
+    def _thread_vars(self):
+        return [self.th_type, self.th_major, self.th_pitch, self.th_length,
+                self.th_z_start, self.th_clear, self.th_depth, self.th_j,
+                self.th_r, self.th_q, self.th_h, self.th_e, self.th_l, self.th_rpm]
+
+    def _build_thread_tab(self):
+        body = ttk.Frame(self.thread_tab)
+        body.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
+
+        left = ttk.LabelFrame(body, text=" Thread Parameters ", padding="10")
+        left.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
+
+        def label(r, text):
+            ttk.Label(left, text=text).grid(row=r, column=0, sticky=tk.W, pady=2)
+
+        def hint(r, text):
+            ttk.Label(left, text=text, foreground="gray").grid(
+                row=r, column=2, sticky=tk.W, padx=(8, 0))
+
+        def entry(r, text, var, tip=""):
+            label(r, text)
+            ttk.Entry(left, textvariable=var, width=10).grid(
+                row=r, column=1, sticky=tk.W, padx=(8, 0), pady=2)
+            if tip:
+                hint(r, tip)
+
+        label(0, "Type:")
+        ttk.Combobox(left, textvariable=self.th_type, values=["External", "Internal"],
+                     state="readonly", width=9).grid(row=0, column=1, sticky=tk.W, padx=(8, 0), pady=2)
+
+        label(1, "ISO preset:")
+        preset = ttk.Combobox(left, textvariable=self.th_preset, width=9, state="readonly",
+                              values=[p[0] for p in ISO_COARSE_PRESETS])
+        preset.grid(row=1, column=1, sticky=tk.W, padx=(8, 0), pady=2)
+        preset.bind("<<ComboboxSelected>>", self._on_thread_preset)
+        hint(1, "fills major dia + pitch")
+
+        entry(2, "Major dia (D):", self.th_major, "mm, nominal")
+        entry(3, "Pitch (P):", self.th_pitch, "mm/rev")
+        entry(4, "Thread length:", self.th_length, "mm, from Z0 toward chuck")
+        entry(5, "Start Z (lead-in):", self.th_z_start, "mm, room for Z to get up to speed")
+        entry(6, "Radial clearance:", self.th_clear, "mm, drive line offset (sets I)")
+        entry(7, "Depth K (0 = auto):", self.th_depth, "auto: 0.6134P ext / 0.5413P int")
+        entry(8, "First cut (J):", self.th_j, "mm, radial")
+        entry(9, "Degression (R):", self.th_r, "1 = const depth, 2 = const area")
+        entry(10, "Compound (Q):", self.th_q, "29.5 for 60\u00b0 thread, 0 = plunge")
+        entry(11, "Spring passes (H):", self.th_h)
+        entry(12, "Taper dist (E):", self.th_e, "mm along drive line")
+
+        label(13, "Taper ends (L):")
+        ttk.Combobox(left, textvariable=self.th_l, state="readonly", width=9,
+                     values=["0 - None", "1 - Entry", "2 - Exit", "3 - Both"]).grid(
+            row=13, column=1, sticky=tk.W, padx=(8, 0), pady=2)
+
+        entry(14, "Thread RPM:", self.th_rpm, "constant RPM (G97)")
+
+        btns = ttk.Frame(left)
+        btns.grid(row=15, column=0, columnspan=3, sticky=tk.W, pady=(12, 6))
+        ttk.Button(btns, text="\U0001F504 Preview", command=lambda: self.update_thread_preview()).pack(side=tk.LEFT)
+        ttk.Button(btns, text="\u26a1 Export G-Code", command=self.export_thread_gcode).pack(side=tk.LEFT, padx=(8, 0))
+
+        self.th_info = ttk.Label(left, text="", justify=tk.LEFT, wraplength=420)
+        self.th_info.grid(row=16, column=0, columnspan=3, sticky=tk.W, pady=(6, 0))
+
+        right = ttk.LabelFrame(body, text=" G-Code Review ", padding="5")
+        right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        container = ttk.Frame(right)
+        container.pack(fill=tk.BOTH, expand=True)
+        sb = ttk.Scrollbar(container)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.thread_gcode_text = tk.Text(container, wrap="none", bg="#1e1e1e", fg="#dddddd",
+                                         insertbackground="#dddddd", font=("Courier New", 9),
+                                         yscrollcommand=sb.set, state="disabled")
+        self.thread_gcode_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.config(command=self.thread_gcode_text.yview)
+        self.thread_gcode_text.tag_configure("g_tag", foreground="#33ff33")
+        self.thread_gcode_text.tag_configure("m_tag", foreground="#4da6ff")
+        self.thread_gcode_text.tag_configure("z_tag", foreground="#ff5555")
+
+        # Live preview: regenerate whenever any field changes.
+        for var in self._thread_vars():
+            var.trace_add("write", lambda *_: self.update_thread_preview(silent=True))
+        self.update_thread_preview(silent=True)
+
+    def _on_thread_preset(self, _event=None):
+        for label_text, dia, pitch in ISO_COARSE_PRESETS:
+            if label_text == self.th_preset.get():
+                self.th_major.set(f"{dia:g}")
+                self.th_pitch.set(f"{pitch:g}")
+                break
+
+    def _read_thread_params(self):
+        try:
+            return dict(
+                external=(self.th_type.get() == "External"),
+                major_dia=float(self.th_major.get()),
+                pitch=float(self.th_pitch.get()),
+                length=float(self.th_length.get()),
+                z_start=float(self.th_z_start.get()),
+                clearance=float(self.th_clear.get()),
+                depth_override=float(self.th_depth.get()),
+                first_cut=float(self.th_j.get()),
+                degression=float(self.th_r.get()),
+                compound_angle=float(self.th_q.get()),
+                spring_passes=int(float(self.th_h.get())),
+                taper_dist=float(self.th_e.get()),
+                taper_ends=int(self.th_l.get().strip()[0]),
+                rpm=float(self.th_rpm.get()),
+            )
+        except (ValueError, IndexError):
+            raise ValueError("All thread entries must be valid numbers.")
+
+    def update_thread_preview(self, silent=False):
+        try:
+            params = self._read_thread_params()
+            text = build_thread_program(**params)
+            geo = thread_geometry(params["external"], params["major_dia"], params["pitch"],
+                                  params["clearance"], params["depth_override"])
+        except Exception as e:
+            if silent:
+                self.th_info.config(text=str(e), foreground="#cc3333")
+            else:
+                messagebox.showerror("Error", str(e))
+            return
+        self._show_gcode(text, widget=self.thread_gcode_text)
+
+        passes = estimate_pass_count(params["first_cut"], geo["k"], params["degression"])
+        if params["external"]:
+            size_line = f"Pre-turn OD: {geo['peak_dia']:.3f}   Root dia: {geo['root_dia']:.3f}"
+        else:
+            size_line = f"Pre-bore dia: {geo['peak_dia']:.3f}   Root dia: {geo['root_dia']:.3f}"
+        self.th_info.config(
+            text=(f"{size_line}\n"
+                  f"Depth K: {geo['k']:.3f}   Drive line: X{geo['drive_dia']:.3f}   I{geo['i']:.3f}\n"
+                  f"~{passes} cutting passes + {params['spring_passes']} spring"),
+            foreground="gray")
+
+    def export_thread_gcode(self):
+        try:
+            params = self._read_thread_params()
+            build_thread_program(**params)  # validate before asking for a filename
+        except ValueError as e:
+            messagebox.showerror("Error", str(e))
+            return
+
+        kind = "ext" if params["external"] else "int"
+        initial = f"thread_M{params['major_dia']:g}x{params['pitch']:g}_{kind}.ngc"
+        start_dir = os.path.dirname(self.selected_file_path) if self.selected_file_path else os.getcwd()
+        out_path = filedialog.asksaveasfilename(
+            defaultextension=".ngc", initialfile=initial, initialdir=start_dir,
+            filetypes=[("LinuxCNC G-Code", "*.ngc"), ("All Files", "*.*")])
+        if not out_path:
+            return
+        try:
+            text = export_thread_file(out_path, **params)
+            self._show_gcode(text, widget=self.thread_gcode_text)
+            self._save_settings()
+            messagebox.showinfo("Success", f"Thread G-Code written to:\n{os.path.basename(out_path)}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Export Failed: {str(e)}")
         
     def browse_file(self):
         s = filedialog.askopenfilename(filetypes=[("DXF Files", "*.dxf")])

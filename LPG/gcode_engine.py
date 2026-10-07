@@ -411,7 +411,7 @@ def export_linuxcnc_file(out_path, profile, stock_dia, doc, allowance,
         gcode.append(f"G96 S{css_speed:.0f}    ; CSS")
     gcode.append("G00 Z0.0")
     gcode.append(f"{feed_gcode} ; {feed_desc} for plunge cut")
-    gcode.append(f"G01 X{face_cut:.3f} F{feed:.3f} ; Cut past center for tool radius")
+    gcode.append(f"G01 X{face_cut:.3f} F{feed:.1f} ; Cut past center for tool radius")
     gcode.append(f"{feed_gcode} ; {feed_desc}")
     gcode.append(f"G00 Z{clr:.3f}\n")
 
@@ -473,38 +473,38 @@ def export_linuxcnc_file(out_path, profile, stock_dia, doc, allowance,
 
         if z_limit is None:
             # The boundary never gets in the way at this diameter.
-            gcode.append(f"G01 Z{full_length_z:.3f} F{pass_feed:.3f}")
-            gcode.append(f"G01 X{x_relief:.3f} F{pass_feed:.3f}")
+            gcode.append(f"G01 Z{full_length_z:.3f} F{pass_feed:.1f}")
+            gcode.append(f"G01 X{x_relief:.3f} F{pass_feed:.1f}")
         elif not tail_traced:
             # First pass to reach the boundary - it alone is responsible for
             # clearing everything deeper. Cut to the safe depth, then trace
             # the true finish-allowance boundary the rest of the way to the
             # end (no later, smaller pass will ever need to visit it again).
-            gcode.append(f"G01 Z{z_limit:.3f} F{pass_feed:.3f}")
+            gcode.append(f"G01 Z{z_limit:.3f} F{pass_feed:.1f}")
             last_pos = (z_limit, target_r)
             for seg in allowance_boundary:
                 if seg["p2"][0] < z_limit - 1e-9:
                     if math.hypot(last_pos[0] - seg["p1"][0], last_pos[1] - seg["p1"][1]) < 1e-6:
                         # Tool is actually on this segment's own curve -
                         # cut it properly (G02/G03 for an arc).
-                        _emit_cut(gcode, seg, feed_str=f" F{pass_feed:.3f}")
+                        _emit_cut(gcode, seg, feed_str=f" F{pass_feed:.1f}")
                     elif seg["kind"] == "line":                        
                         tz, tr = seg["p2"]
-                        gcode.append(f"G01 X{tr * 2:.3f} Z{tz:.3f} F{pass_feed:.3f}")
+                        gcode.append(f"G01 X{tr * 2:.3f} Z{tz:.3f} F{pass_feed:.1f}")
                     else:                        
                         z1, z2 = seg["p1"][0], seg["p2"][0]
                         z_on = max(min(z1, z2), min(max(z1, z2), last_pos[0]))
                         r_here = _r_at_z(seg, z_on)
-                        gcode.append(f"G01 X{r_here * 2:.3f} Z{z_on:.3f} F{pass_feed:.3f}")
-                        _emit_cut(gcode, seg, feed_str=f" F{pass_feed:.3f}")
+                        gcode.append(f"G01 X{r_here * 2:.3f} Z{z_on:.3f} F{pass_feed:.1f}")
+                        _emit_cut(gcode, seg, feed_str=f" F{pass_feed:.1f}")
                     last_pos = seg["p2"]
-            gcode.append(f"G01 X{x_relief:.3f} F{pass_feed:.3f}")
+            gcode.append(f"G01 X{x_relief:.3f} F{pass_feed:.1f}")
             tail_traced = True
         else:
             # The tail was already cleared by an earlier pass - just take
             # this shallower slice and retract to what that pass left behind.
-            gcode.append(f"G01 Z{z_limit:.3f} F{pass_feed:.3f}")
-            gcode.append(f"G01 X{prev_dia:.3f} F{pass_feed:.3f}")
+            gcode.append(f"G01 Z{z_limit:.3f} F{pass_feed:.1f}")
+            gcode.append(f"G01 X{prev_dia:.3f} F{pass_feed:.1f}")
 
         gcode.append(f"G00 Z{clr:.3f}")
         prev_dia = curr_dia
@@ -528,12 +528,12 @@ def export_linuxcnc_file(out_path, profile, stock_dia, doc, allowance,
 
     gcode.append("\n; --- Step 3: Profile Contour Finishing Pass ---")
     gcode.append(f"G00 X{face_cut:.3f} Z{clr:.3f}")
-    gcode.append(f"G01 X{face_cut:.3f} Z0.000 F{feed * 0.5:.3f}")
+    gcode.append(f"G01 X{face_cut:.3f} Z0.000 F{feed * 0.5:.1f}")
     for seg in compensated:
         _emit_cut(gcode, seg)
 
     last_z = compensated[-1]["p2"][0] if compensated else 0.0
-    gcode.append(f"G01 X{x_relief:.3f} Z{last_z:.3f} F{feed:.3f}")
+    gcode.append(f"G01 X{x_relief:.3f} Z{last_z:.3f} F{feed:.1f}")
 
     gcode.append("")
     with open("footer.txt", "r") as f: gcode.append(f.read().strip())
